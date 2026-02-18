@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	tiktoken "github.com/pkoukk/tiktoken-go"
+	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
 )
 
 type Value struct {
@@ -24,19 +27,22 @@ type Value struct {
 }
 
 type DatasetRecord struct {
-	RecordType string   `json:"record_type"`
-	Text       string   `json:"text,omitempty"`
-	Question   string   `json:"question,omitempty"`
-	Answer     string   `json:"answer,omitempty"`
-	Input      string   `json:"input,omitempty"`
-	Output     string   `json:"output,omitempty"`
-	Task       string   `json:"task,omitempty"`
-	Actions    []string `json:"actions,omitempty"`
-	Result     string   `json:"result,omitempty"`
-	Prompt     string   `json:"prompt,omitempty"`
-	Chosen     string   `json:"chosen,omitempty"`
-	Rejected   string   `json:"rejected,omitempty"`
-	ID         string   `json:"id,omitempty"`
+	RecordType  string   `json:"record_type"`
+	Text        string   `json:"text,omitempty"`
+	Question    string   `json:"question,omitempty"`
+	Answer      string   `json:"answer,omitempty"`
+	Input       string   `json:"input,omitempty"`
+	Output      string   `json:"output,omitempty"`
+	Task        string   `json:"task,omitempty"`
+	Actions     []string `json:"actions,omitempty"`
+	Result      string   `json:"result,omitempty"`
+	Prompt      string   `json:"prompt,omitempty"`
+	Chosen      string   `json:"chosen,omitempty"`
+	Rejected    string   `json:"rejected,omitempty"`
+	ID          string   `json:"id,omitempty"`
+	Instruction string   `json:"instruction,omitempty"`
+	Response    string   `json:"response,omitempty"`
+	Context     string   `json:"context,omitempty"`
 }
 
 func copyExampleDataset(path string, cause error) error {
@@ -139,6 +145,22 @@ func parseDatasetLine(line string, lineNo int) (DatasetRecord, string, error) {
 	var rec DatasetRecord
 	if err := json.Unmarshal([]byte(line), &rec); err != nil {
 		return DatasetRecord{}, "", fmt.Errorf("invalid JSON at line %d: %w", lineNo, err)
+	}
+	// Compatibility path for raw Dolly-style rows (instruction/response/context).
+	// We synthesize required schema fields so raw public datasets can be used directly.
+	if normalize(rec.ID) == "" && normalize(rec.RecordType) == "" {
+		inst := normalize(rec.Instruction)
+		resp := normalize(rec.Response)
+		if inst != "" && resp != "" {
+			rec.ID = fmt.Sprintf("dolly-auto-%d", lineNo)
+			rec.RecordType = "chat"
+			if ctx := normalize(rec.Context); ctx != "" {
+				rec.Input = inst + "\nContext: " + ctx
+			} else {
+				rec.Input = inst
+			}
+			rec.Output = resp
+		}
 	}
 	doc, err := validateAndExtractDoc(rec)
 	if err != nil {
@@ -317,46 +339,7 @@ func maybeDownloadDefaultJSONL(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
-	url := "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
-	resp, err := http.Get(url)
-	if err != nil {
-		return copyExampleDataset(path, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return copyExampleDataset(path, fmt.Errorf("failed download: %s", resp.Status))
-	}
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	scanner := bufio.NewScanner(resp.Body)
-	writer := bufio.NewWriter(out)
-	bootstrapIdx := 0
-	for scanner.Scan() {
-		name := strings.TrimSpace(scanner.Text())
-		if name == "" {
-			continue
-		}
-		bootstrapIdx++
-		rec := DatasetRecord{
-			ID:         fmt.Sprintf("bootstrap-%d", bootstrapIdx),
-			RecordType: "knowledge",
-			Text:       name,
-		}
-		b, err := json.Marshal(rec)
-		if err != nil {
-			return err
-		}
-		if _, err := writer.WriteString(string(b) + "\n"); err != nil {
-			return err
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return writer.Flush()
+	return copyExampleDataset(path, fmt.Errorf("dataset not found at %s", path))
 }
 
 func loadDocsJSONL(path string) ([]string, error) {
@@ -389,17 +372,177 @@ func loadDocsJSONL(path string) ([]string, error) {
 func sampleWeighted(weights []float64) int {
 	total := 0.0
 	for _, w := range weights {
-		total += w
+		if w > 0 && !math.IsNaN(w) && !math.IsInf(w, 0) {
+			total += w
+		}
+	}
+	if total <= 0 {
+		return rand.Intn(len(weights))
 	}
 	r := rand.Float64() * total
 	acc := 0.0
 	for i, w := range weights {
-		acc += w
+		if w > 0 && !math.IsNaN(w) && !math.IsInf(w, 0) {
+			acc += w
+		}
 		if r <= acc {
 			return i
 		}
 	}
 	return len(weights) - 1
+}
+
+func softmaxFloat(logits []float64) []float64 {
+	if len(logits) == 0 {
+		return nil
+	}
+	maxV := logits[0]
+	for _, v := range logits[1:] {
+		if v > maxV {
+			maxV = v
+		}
+	}
+	expVals := make([]float64, len(logits))
+	sum := 0.0
+	for i, v := range logits {
+		ev := math.Exp(v - maxV)
+		expVals[i] = ev
+		sum += ev
+	}
+	if sum <= 0 {
+		return expVals
+	}
+	for i := range expVals {
+		expVals[i] /= sum
+	}
+	return expVals
+}
+
+func applyTopK(weights []float64, k int) []float64 {
+	if k <= 0 || k >= len(weights) {
+		return weights
+	}
+	type kv struct {
+		i int
+		w float64
+	}
+	arr := make([]kv, len(weights))
+	for i, w := range weights {
+		arr[i] = kv{i: i, w: w}
+	}
+	sort.Slice(arr, func(i, j int) bool { return arr[i].w > arr[j].w })
+	keep := map[int]bool{}
+	for i := 0; i < k && i < len(arr); i++ {
+		keep[arr[i].i] = true
+	}
+	out := make([]float64, len(weights))
+	for i, w := range weights {
+		if keep[i] {
+			out[i] = w
+		}
+	}
+	return out
+}
+
+func applyTopP(weights []float64, p float64) []float64 {
+	if p <= 0 || p >= 1 {
+		return weights
+	}
+	type kv struct {
+		i int
+		w float64
+	}
+	arr := make([]kv, len(weights))
+	for i, w := range weights {
+		arr[i] = kv{i: i, w: w}
+	}
+	sort.Slice(arr, func(i, j int) bool { return arr[i].w > arr[j].w })
+	cum := 0.0
+	keep := map[int]bool{}
+	for _, it := range arr {
+		if it.w <= 0 {
+			continue
+		}
+		keep[it.i] = true
+		cum += it.w
+		if cum >= p {
+			break
+		}
+	}
+	out := make([]float64, len(weights))
+	for i, w := range weights {
+		if keep[i] {
+			out[i] = w
+		}
+	}
+	return out
+}
+
+func nextTokenWeights(logits []*Value, temperature float64, topK int, topP float64, recent map[int]bool, repetitionPenalty float64) []float64 {
+	if temperature <= 0 {
+		temperature = 1.0
+	}
+	raw := make([]float64, len(logits))
+	for i, l := range logits {
+		v := l.Data
+		if repetitionPenalty > 1 && recent[i] {
+			v /= repetitionPenalty
+		}
+		raw[i] = v / temperature
+	}
+	w := softmaxFloat(raw)
+	w = applyTopK(w, topK)
+	w = applyTopP(w, topP)
+	return w
+}
+
+func evalLoss(gpt func(tokenID, posID int, keys, values [][][]*Value) []*Value, docs [][]int, nLayer, blockSize, bosID, maxDocs int) float64 {
+	if len(docs) == 0 {
+		return math.Inf(1)
+	}
+	steps := len(docs)
+	if maxDocs > 0 && maxDocs < steps {
+		steps = maxDocs
+	}
+	total := 0.0
+	count := 0
+	for i := 0; i < steps; i++ {
+		doc := docs[i%len(docs)]
+		tokens := make([]int, 0, len(doc)+2)
+		tokens = append(tokens, bosID)
+		tokens = append(tokens, doc...)
+		tokens = append(tokens, bosID)
+		n := len(tokens) - 1
+		if n > blockSize {
+			n = blockSize
+		}
+		if n <= 0 {
+			continue
+		}
+		keys := make([][][]*Value, nLayer)
+		values := make([][][]*Value, nLayer)
+		for posID := 0; posID < n; posID++ {
+			tokenID, targetID := tokens[posID], tokens[posID+1]
+			logits := gpt(tokenID, posID, keys, values)
+			weights := softmaxFloat(func() []float64 {
+				tmp := make([]float64, len(logits))
+				for i, l := range logits {
+					tmp[i] = l.Data
+				}
+				return tmp
+			}())
+			p := weights[targetID]
+			if p < 1e-12 {
+				p = 1e-12
+			}
+			total += -math.Log(p)
+			count++
+		}
+	}
+	if count == 0 {
+		return math.Inf(1)
+	}
+	return total / float64(count)
 }
 
 func envInt(name string, def int) int {
@@ -478,12 +621,41 @@ func previewRunes(s string, max int) string {
 	return string(rs[:max]) + "..."
 }
 
+func slugifyName(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return "run"
+	}
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			b.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		if !prevDash {
+			b.WriteRune('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "run"
+	}
+	return out
+}
+
 type TrainingCheckpoint struct {
-	Version   int                      `json:"version"`
-	CreatedAt string                   `json:"created_at"`
-	Config    TrainingCheckpointConfig `json:"config"`
-	Vocab     []string                 `json:"vocab"`
-	State     map[string][][]float64   `json:"state"`
+	Version      int                      `json:"version"`
+	CreatedAt    string                   `json:"created_at"`
+	Config       TrainingCheckpointConfig `json:"config"`
+	Tokenization string                   `json:"tokenization,omitempty"`
+	BPEEncoding  string                   `json:"bpe_encoding,omitempty"`
+	BPETokenIDs  []int                    `json:"bpe_token_ids,omitempty"`
+	Vocab        []string                 `json:"vocab,omitempty"`
+	State        map[string][][]float64   `json:"state"`
 }
 
 type TrainingCheckpointConfig struct {
@@ -493,12 +665,52 @@ type TrainingCheckpointConfig struct {
 	BlockSize int `json:"block_size"`
 }
 
+type tokenizerRuntime struct {
+	mode        string
+	bpeEncoding string
+	bpe         *tiktoken.Tiktoken
+	bpeToLocal  map[int]int
+	localToBPE  []int
+	charToLocal map[rune]int
+	localToChar []rune
+	unkID       int
+	bosID       int
+}
+
 func runesToStrings(rs []rune) []string {
 	out := make([]string, len(rs))
 	for i, r := range rs {
 		out[i] = string(r)
 	}
 	return out
+}
+
+func runOutput(name string, args ...string) string {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func gpuCheck() {
+	fmt.Println("GPU readiness check")
+	fmt.Println("trainer backend: CPU kernels (GPU math kernels not wired yet)")
+	smi := runOutput("nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader")
+	if smi == "" {
+		fmt.Println("nvidia-smi: not available (NVIDIA runtime not detected)")
+		fmt.Println("recommended for this project now: TRAIN_DEVICE=cpu")
+		return
+	}
+	fmt.Println("nvidia-smi:", strings.Split(smi, "\n")[0])
+	nvcc := runOutput("nvcc", "--version")
+	if nvcc == "" {
+		fmt.Println("nvcc: not found (CUDA toolkit missing or not in PATH)")
+	} else {
+		lines := strings.Split(nvcc, "\n")
+		fmt.Println("nvcc:", lines[len(lines)-1])
+	}
+	fmt.Println("status: GPU present, but training still executes on CPU in current codebase")
 }
 
 func stringsToRunes(ss []string) ([]rune, error) {
@@ -511,6 +723,197 @@ func stringsToRunes(ss []string) ([]rune, error) {
 		out = append(out, r[0])
 	}
 	return out, nil
+}
+
+func (t tokenizerRuntime) vocabSize() int {
+	if t.mode == "bpe_cl100k" {
+		return len(t.localToBPE) + 2
+	}
+	return len(t.localToChar) + 1
+}
+
+func (t tokenizerRuntime) encodeDoc(doc string) []int {
+	if t.mode == "bpe_cl100k" {
+		raw := t.bpe.EncodeOrdinary(doc)
+		out := make([]int, 0, len(raw))
+		for _, id := range raw {
+			if local, ok := t.bpeToLocal[id]; ok {
+				out = append(out, local)
+			} else {
+				out = append(out, t.unkID)
+			}
+		}
+		return out
+	}
+	out := make([]int, 0, len(doc))
+	for _, r := range doc {
+		if id, ok := t.charToLocal[r]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (t tokenizerRuntime) decodeTokens(tokens []int) string {
+	if t.mode == "bpe_cl100k" {
+		raw := make([]int, 0, len(tokens))
+		for _, local := range tokens {
+			if local >= 0 && local < len(t.localToBPE) {
+				raw = append(raw, t.localToBPE[local])
+			}
+		}
+		return t.bpe.Decode(raw)
+	}
+	out := make([]rune, 0, len(tokens))
+	for _, id := range tokens {
+		if id >= 0 && id < len(t.localToChar) {
+			out = append(out, t.localToChar[id])
+		}
+	}
+	return string(out)
+}
+
+func buildTokenizer(mode, bpeEncoding string, targetVocab int, trainDocs []string) (tokenizerRuntime, [][]int, error) {
+	if strings.EqualFold(mode, "bpe") {
+		encName := strings.TrimSpace(bpeEncoding)
+		if encName == "" {
+			encName = "cl100k_base"
+		}
+		enc, err := tiktoken.GetEncoding(encName)
+		if err != nil {
+			return tokenizerRuntime{}, nil, err
+		}
+		if targetVocab < 512 {
+			targetVocab = 512
+		}
+		rawDocs := make([][]int, 0, len(trainDocs))
+		freq := map[int]int{}
+		for _, doc := range trainDocs {
+			ids := enc.EncodeOrdinary(doc)
+			rawDocs = append(rawDocs, ids)
+			for _, id := range ids {
+				freq[id]++
+			}
+		}
+		type kv struct {
+			id  int
+			cnt int
+		}
+		arr := make([]kv, 0, len(freq))
+		for id, cnt := range freq {
+			arr = append(arr, kv{id: id, cnt: cnt})
+		}
+		sort.Slice(arr, func(i, j int) bool {
+			if arr[i].cnt == arr[j].cnt {
+				return arr[i].id < arr[j].id
+			}
+			return arr[i].cnt > arr[j].cnt
+		})
+		keep := targetVocab - 2 // reserve UNK + BOS
+		if keep > len(arr) {
+			keep = len(arr)
+		}
+		localToBPE := make([]int, 0, keep)
+		bpeToLocal := make(map[int]int, keep)
+		for i := 0; i < keep; i++ {
+			id := arr[i].id
+			bpeToLocal[id] = len(localToBPE)
+			localToBPE = append(localToBPE, id)
+		}
+		tok := tokenizerRuntime{
+			mode:        "bpe_cl100k",
+			bpeEncoding: encName,
+			bpe:         enc,
+			bpeToLocal:  bpeToLocal,
+			localToBPE:  localToBPE,
+			unkID:       len(localToBPE),
+			bosID:       len(localToBPE) + 1,
+		}
+		tokenized := make([][]int, 0, len(rawDocs))
+		for _, raw := range rawDocs {
+			mapped := make([]int, 0, len(raw))
+			for _, id := range raw {
+				if local, ok := bpeToLocal[id]; ok {
+					mapped = append(mapped, local)
+				} else {
+					mapped = append(mapped, tok.unkID)
+				}
+			}
+			tokenized = append(tokenized, mapped)
+		}
+		return tok, tokenized, nil
+	}
+
+	charset := map[rune]bool{}
+	for _, d := range trainDocs {
+		for _, r := range d {
+			charset[r] = true
+		}
+	}
+	uchars := make([]rune, 0, len(charset))
+	for r := range charset {
+		uchars = append(uchars, r)
+	}
+	sort.Slice(uchars, func(i, j int) bool { return uchars[i] < uchars[j] })
+	charToLocal := make(map[rune]int, len(uchars))
+	for i, r := range uchars {
+		charToLocal[r] = i
+	}
+	tok := tokenizerRuntime{
+		mode:        "char",
+		charToLocal: charToLocal,
+		localToChar: uchars,
+		bosID:       len(uchars),
+	}
+	tokenized := make([][]int, 0, len(trainDocs))
+	for _, d := range trainDocs {
+		tokenized = append(tokenized, tok.encodeDoc(d))
+	}
+	return tok, tokenized, nil
+}
+
+func tokenizerFromCheckpoint(ckpt TrainingCheckpoint) (tokenizerRuntime, error) {
+	if ckpt.Tokenization == "bpe_cl100k" || len(ckpt.BPETokenIDs) > 0 {
+		encName := strings.TrimSpace(ckpt.BPEEncoding)
+		if encName == "" {
+			encName = "cl100k_base"
+		}
+		enc, err := tiktoken.GetEncoding(encName)
+		if err != nil {
+			return tokenizerRuntime{}, err
+		}
+		localToBPE := append([]int(nil), ckpt.BPETokenIDs...)
+		bpeToLocal := make(map[int]int, len(localToBPE))
+		for i, id := range localToBPE {
+			bpeToLocal[id] = i
+		}
+		return tokenizerRuntime{
+			mode:        "bpe_cl100k",
+			bpeEncoding: encName,
+			bpe:         enc,
+			bpeToLocal:  bpeToLocal,
+			localToBPE:  localToBPE,
+			unkID:       len(localToBPE),
+			bosID:       len(localToBPE) + 1,
+		}, nil
+	}
+	uchars, err := stringsToRunes(ckpt.Vocab)
+	if err != nil {
+		return tokenizerRuntime{}, err
+	}
+	if len(uchars) == 0 {
+		return tokenizerRuntime{}, fmt.Errorf("checkpoint has empty character vocab")
+	}
+	charToLocal := make(map[rune]int, len(uchars))
+	for i, r := range uchars {
+		charToLocal[r] = i
+	}
+	return tokenizerRuntime{
+		mode:        "char",
+		charToLocal: charToLocal,
+		localToChar: uchars,
+		bosID:       len(uchars),
+	}, nil
 }
 
 func exportState(state map[string][][]*Value) map[string][][]float64 {
@@ -571,7 +974,11 @@ func loadCheckpoint(path string) (TrainingCheckpoint, error) {
 	if ckpt.Config.NEmbd%ckpt.Config.NHead != 0 {
 		return TrainingCheckpoint{}, fmt.Errorf("invalid checkpoint: n_embd must be divisible by n_head")
 	}
-	if len(ckpt.Vocab) == 0 {
+	if ckpt.Tokenization == "bpe_cl100k" || len(ckpt.BPETokenIDs) > 0 {
+		if len(ckpt.BPETokenIDs) == 0 {
+			return TrainingCheckpoint{}, fmt.Errorf("invalid checkpoint: bpe tokenization requires bpe_token_ids")
+		}
+	} else if len(ckpt.Vocab) == 0 {
 		return TrainingCheckpoint{}, fmt.Errorf("invalid checkpoint: empty vocab")
 	}
 	return ckpt, nil
@@ -656,15 +1063,11 @@ func runChatOnce(checkpointPath, prompt string) error {
 	if err != nil {
 		return err
 	}
-	uchars, err := stringsToRunes(ckpt.Vocab)
+	tokenizer, err := tokenizerFromCheckpoint(ckpt)
 	if err != nil {
 		return err
 	}
-	stoi := make(map[rune]int, len(uchars))
-	for i, r := range uchars {
-		stoi[r] = i
-	}
-	BOS := len(uchars)
+	BOS := tokenizer.bosID
 
 	state := importState(ckpt.State)
 	nLayer := ckpt.Config.NLayer
@@ -681,20 +1084,33 @@ func runChatOnce(checkpointPath, prompt string) error {
 	if maxNew < 1 {
 		maxNew = 180
 	}
+	topK := envInt("CHAT_TOP_K", 40)
+	topP := envFloat("CHAT_TOP_P", 0.9)
+	if topP <= 0 || topP > 1 {
+		topP = 0.9
+	}
+	repetitionPenalty := envFloat("CHAT_REPETITION_PENALTY", 1.1)
+	if repetitionPenalty < 1.0 {
+		repetitionPenalty = 1.0
+	}
+	minNew := envInt("CHAT_MIN_NEW_TOKENS", 24)
+	if minNew < 0 {
+		minNew = 0
+	}
+	repeatLastN := envInt("CHAT_REPEAT_LAST_N", 64)
+	if repeatLastN < 1 {
+		repeatLastN = 64
+	}
 
-	promptRunes := []rune(prompt)
-	if len(promptRunes) > blockSize-1 {
-		promptRunes = promptRunes[len(promptRunes)-(blockSize-1):]
+	promptTokens := tokenizer.encodeDoc(prompt)
+	if len(promptTokens) > blockSize-1 {
+		promptTokens = promptTokens[len(promptTokens)-(blockSize-1):]
 	}
 	keys := make([][][]*Value, nLayer)
 	values := make([][][]*Value, nLayer)
 	tokenID := BOS
 	pos := 0
-	for _, r := range promptRunes {
-		nextID, ok := stoi[r]
-		if !ok {
-			continue
-		}
+	for _, nextID := range promptTokens {
 		if pos >= blockSize {
 			break
 		}
@@ -703,35 +1119,40 @@ func runChatOnce(checkpointPath, prompt string) error {
 		pos++
 	}
 
-	out := make([]rune, 0, maxNew)
+	out := make([]int, 0, maxNew)
+	recent := make([]int, 0, repeatLastN)
 	for pos < blockSize && len(out) < maxNew {
 		logits := gpt(tokenID, pos, keys, values)
-		scaled := make([]*Value, len(logits))
-		for i, l := range logits {
-			scaled[i] = Div(l, V(temp))
+		recentSet := map[int]bool{}
+		for _, id := range recent {
+			recentSet[id] = true
 		}
-		probs := softmax(scaled)
-		weights := make([]float64, len(probs))
-		for i, p := range probs {
-			weights[i] = p.Data
+		weights := nextTokenWeights(logits, temp, topK, topP, recentSet, repetitionPenalty)
+		if len(out) < minNew && BOS >= 0 && BOS < len(weights) {
+			weights[BOS] = 0
 		}
 		tokenID = sampleWeighted(weights)
 		if tokenID == BOS {
 			break
 		}
-		out = append(out, uchars[tokenID])
+		out = append(out, tokenID)
+		recent = append(recent, tokenID)
+		if len(recent) > repeatLastN {
+			recent = recent[len(recent)-repeatLastN:]
+		}
 		pos++
 	}
-	fmt.Print(string(out))
+	fmt.Print(tokenizer.decodeTokens(out))
 	return nil
 }
 
 func main() {
 	rand.Seed(42)
+	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
 
 	datasetPath := normalize(os.Getenv("DATASET_PATH"))
 	if datasetPath == "" {
-		datasetPath = "assistant_dataset_train.jsonl"
+		datasetPath = "datasets/raw/databricks-dolly-15k.jsonl"
 	}
 	if len(os.Args) > 1 && os.Args[1] == "chat-once" {
 		if len(os.Args) < 4 {
@@ -742,6 +1163,10 @@ func main() {
 		if err := runChatOnce(checkpointPath, prompt); err != nil {
 			panic(err)
 		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "gpu-check" {
+		gpuCheck()
 		return
 	}
 	if err := maybeDownloadDefaultJSONL(datasetPath); err != nil {
@@ -779,31 +1204,57 @@ func main() {
 		panic("assistant_dataset_train.jsonl loaded but no documents found")
 	}
 	rand.Shuffle(len(docs), func(i, j int) { docs[i], docs[j] = docs[j], docs[i] })
-	fmt.Printf("dataset: %s | num docs: %d\n", datasetPath, len(docs))
+	valSplit := envFloat("VAL_SPLIT", 0.10)
+	if valSplit <= 0 || valSplit >= 0.5 {
+		valSplit = 0.10
+	}
+	valCount := int(float64(len(docs)) * valSplit)
+	if valCount < 1 {
+		valCount = 1
+	}
+	if valCount >= len(docs) {
+		valCount = len(docs) - 1
+	}
+	trainDocsText := docs[:len(docs)-valCount]
+	valDocsText := docs[len(docs)-valCount:]
+	fmt.Printf("dataset: %s | num docs: %d (train=%d val=%d)\n", datasetPath, len(docs), len(trainDocsText), len(valDocsText))
 
-	charset := map[rune]bool{}
-	for _, d := range docs {
-		for _, r := range d {
-			charset[r] = true
+	tokenizerMode := strings.ToLower(normalize(os.Getenv("TOKENIZER")))
+	if tokenizerMode == "" {
+		tokenizerMode = "bpe"
+	}
+	bpeEncoding := normalize(os.Getenv("BPE_ENCODING"))
+	if bpeEncoding == "" {
+		bpeEncoding = "cl100k_base"
+	}
+	tokenVocabSize := envInt("TOKEN_VOCAB_SIZE", 2048)
+
+	tokenizer, trainDocsTokens, err := buildTokenizer(tokenizerMode, bpeEncoding, tokenVocabSize, trainDocsText)
+	if err != nil {
+		fmt.Printf("[warn] tokenizer setup failed for mode=%s (%v), falling back to character mode\n", tokenizerMode, err)
+		tokenizer, trainDocsTokens, err = buildTokenizer("char", "", tokenVocabSize, trainDocsText)
+		if err != nil {
+			panic(err)
 		}
 	}
-	uchars := make([]rune, 0, len(charset))
-	for r := range charset {
-		uchars = append(uchars, r)
+	valDocsTokens := make([][]int, 0, len(valDocsText))
+	for _, d := range valDocsText {
+		valDocsTokens = append(valDocsTokens, tokenizer.encodeDoc(d))
 	}
-	sort.Slice(uchars, func(i, j int) bool { return uchars[i] < uchars[j] })
-
-	stoi := make(map[rune]int, len(uchars))
-	for i, r := range uchars {
-		stoi[r] = i
+	if len(trainDocsTokens) == 0 {
+		panic("tokenized train docs are empty")
 	}
-	BOS := len(uchars)
-	vocabSize := len(uchars) + 1
+	BOS := tokenizer.bosID
+	vocabSize := tokenizer.vocabSize()
+	fmt.Printf("tokenizer: %s\n", tokenizer.mode)
+	if tokenizer.mode == "bpe_cl100k" {
+		fmt.Printf("bpe encoding: %s | local bpe vocab: %d (+UNK +BOS)\n", tokenizer.bpeEncoding, len(tokenizer.localToBPE))
+	}
 	fmt.Printf("vocab size: %d\n", vocabSize)
 
 	nLayer := envInt("N_LAYER", 1)
-	nEmbd := envInt("N_EMBD", 16)
-	blockSize := envInt("BLOCK_SIZE", 16)
+	nEmbd := envInt("N_EMBD", 48)
+	blockSize := envInt("BLOCK_SIZE", 96)
 	nHead := envInt("N_HEAD", 4)
 	if nLayer < 1 || nEmbd < 1 || blockSize < 2 || nHead < 1 {
 		panic("invalid hyperparameters: ensure N_LAYER>=1, N_EMBD>=1, BLOCK_SIZE>=2, N_HEAD>=1")
@@ -851,14 +1302,14 @@ func main() {
 
 	gpt := buildGPT(state, nLayer, nEmbd, nHead)
 
-	learningRate := envFloat("LEARNING_RATE", 0.01)
+	learningRate := envFloat("LEARNING_RATE", 0.004)
 	beta1 := envFloat("BETA1", 0.85)
 	beta2 := envFloat("BETA2", 0.99)
 	epsAdam := envFloat("EPS_ADAM", 1e-8)
 	m := make([]float64, len(params))
 	v := make([]float64, len(params))
 
-	numSteps := envInt("NUM_STEPS", 1000)
+	numSteps := envInt("NUM_STEPS", 800)
 	verbose := envBool("VERBOSE", false)
 	logLevel := strings.ToLower(normalize(os.Getenv("LOG_LEVEL")))
 	if logLevel == "" {
@@ -873,13 +1324,35 @@ func main() {
 		panic("invalid NUM_STEPS: must be >=1")
 	}
 	fmt.Printf("optimizer: lr=%.5f beta1=%.3f beta2=%.3f eps=%.1e steps=%d\n", learningRate, beta1, beta2, epsAdam, numSteps)
+	evalInterval := envInt("EVAL_INTERVAL", 50)
+	if evalInterval < 1 {
+		evalInterval = 100
+	}
+	evalSteps := envInt("EVAL_STEPS", 16)
+	if evalSteps < 1 {
+		evalSteps = 64
+	}
+	earlyStopPatience := envInt("EARLY_STOP_PATIENCE", 8)
+	if earlyStopPatience < 1 {
+		earlyStopPatience = 8
+	}
+	earlyStopMinDelta := envFloat("EARLY_STOP_MIN_DELTA", 0.0005)
+	if earlyStopMinDelta <= 0 {
+		earlyStopMinDelta = 0.0005
+	}
+	fmt.Printf("validation: interval=%d eval_steps=%d patience=%d min_delta=%.6f\n", evalInterval, evalSteps, earlyStopPatience, earlyStopMinDelta)
+
 	trainStart := time.Now()
+	bestValLoss := math.Inf(1)
+	bestState := exportState(state)
+	noImproveCount := 0
+	actualSteps := 0
 	for step := 0; step < numSteps; step++ {
-		doc := docs[step%len(docs)]
-		tokens := []int{BOS}
-		for _, ch := range doc {
-			tokens = append(tokens, stoi[ch])
-		}
+		doc := trainDocsText[step%len(trainDocsText)]
+		docTok := trainDocsTokens[step%len(trainDocsTokens)]
+		tokens := make([]int, 0, len(docTok)+2)
+		tokens = append(tokens, BOS)
+		tokens = append(tokens, docTok...)
 		tokens = append(tokens, BOS)
 
 		n := len(tokens) - 1
@@ -916,6 +1389,7 @@ func main() {
 			p.Data -= lrT * mHat / (math.Sqrt(vHat) + epsAdam)
 			p.Grad = 0
 		}
+		actualSteps = step + 1
 
 		if verbose {
 			elapsed := time.Since(trainStart).Seconds()
@@ -942,7 +1416,7 @@ func main() {
 					loss.Data,
 					lrT,
 					n,
-					len(doc),
+					len([]rune(doc)),
 					stepsPerSec,
 					time.Since(trainStart).Truncate(time.Second).String(),
 					time.Duration(etaSec*float64(time.Second)).Truncate(time.Second).String(),
@@ -966,6 +1440,24 @@ func main() {
 		} else {
 			fmt.Printf("step %4d / %4d | loss %.4f\r", step+1, numSteps, loss.Data)
 		}
+
+		if (step+1)%evalInterval == 0 || step+1 == numSteps {
+			valLoss := evalLoss(gpt, valDocsTokens, nLayer, blockSize, BOS, evalSteps)
+			improved := bestValLoss-valLoss > earlyStopMinDelta
+			if improved {
+				bestValLoss = valLoss
+				bestState = exportState(state)
+				noImproveCount = 0
+			} else {
+				noImproveCount++
+			}
+			fmt.Printf("[eval] step=%d train_loss=%.4f val_loss=%.4f best_val=%.4f improved=%t patience=%d/%d\n",
+				step+1, loss.Data, valLoss, bestValLoss, improved, noImproveCount, earlyStopPatience)
+			if noImproveCount >= earlyStopPatience {
+				fmt.Printf("[system] early stopping triggered at step %d\n", step+1)
+				break
+			}
+		}
 	}
 
 	temperature := envFloat("TEMPERATURE", 0.5)
@@ -976,32 +1468,57 @@ func main() {
 	if sampleCount < 1 {
 		panic("invalid SAMPLE_COUNT: must be >=1")
 	}
+	topK := envInt("TOP_K", 40)
+	topP := envFloat("TOP_P", 0.9)
+	if topP <= 0 || topP > 1 {
+		topP = 0.9
+	}
+	repetitionPenalty := envFloat("REPETITION_PENALTY", 1.1)
+	if repetitionPenalty < 1.0 {
+		repetitionPenalty = 1.0
+	}
+	minNew := envInt("MIN_NEW_TOKENS", 24)
+	if minNew < 0 {
+		minNew = 0
+	}
+	sampleMaxNew := envInt("SAMPLE_MAX_NEW_TOKENS", 160)
+	if sampleMaxNew < 1 {
+		sampleMaxNew = 160
+	}
+	repeatLastN := envInt("REPEAT_LAST_N", 64)
+	if repeatLastN < 1 {
+		repeatLastN = 64
+	}
 	fmt.Println("\n--- inference (generated samples) ---")
 	for sampleIdx := 0; sampleIdx < sampleCount; sampleIdx++ {
 		keys := make([][][]*Value, nLayer)
 		values := make([][][]*Value, nLayer)
 		tokenID := BOS
-		sample := make([]rune, 0, blockSize)
+		sample := make([]int, 0, sampleMaxNew)
+		recent := make([]int, 0, repeatLastN)
 
-		for posID := 0; posID < blockSize; posID++ {
+		for posID := 0; posID < blockSize && len(sample) < sampleMaxNew; posID++ {
 			logits := gpt(tokenID, posID, keys, values)
-			scaled := make([]*Value, len(logits))
-			for i, l := range logits {
-				scaled[i] = Div(l, V(temperature))
+			recentSet := map[int]bool{}
+			for _, id := range recent {
+				recentSet[id] = true
 			}
-			probs := softmax(scaled)
-			weights := make([]float64, len(probs))
-			for i, p := range probs {
-				weights[i] = p.Data
+			weights := nextTokenWeights(logits, temperature, topK, topP, recentSet, repetitionPenalty)
+			if len(sample) < minNew && BOS >= 0 && BOS < len(weights) {
+				weights[BOS] = 0
 			}
 			tokenID = sampleWeighted(weights)
 			if tokenID == BOS {
 				break
 			}
-			sample = append(sample, uchars[tokenID])
+			sample = append(sample, tokenID)
+			recent = append(recent, tokenID)
+			if len(recent) > repeatLastN {
+				recent = recent[len(recent)-repeatLastN:]
+			}
 		}
 
-		fmt.Printf("sample %2d: %s\n", sampleIdx+1, string(sample))
+		fmt.Printf("sample %2d: %s\n", sampleIdx+1, tokenizer.decodeTokens(sample))
 	}
 
 	modelOut := normalize(os.Getenv("MODEL_OUT_PATH"))
@@ -1009,10 +1526,15 @@ func main() {
 		if err := os.MkdirAll("models", 0o755); err != nil {
 			panic(err)
 		}
-		modelOut = filepath.Join("models", fmt.Sprintf("checkpoint_%s.json", time.Now().Format("20060102_150405")))
+		runName := normalize(os.Getenv("RUN_NAME"))
+		if runName == "" {
+			runName = time.Now().Format("20060102_150405")
+		}
+		runName = slugifyName(runName)
+		modelOut = filepath.Join("models", fmt.Sprintf("ckpt_%s_step%04d_valloss%.4f.json", runName, actualSteps, bestValLoss))
 	}
 	ckpt := TrainingCheckpoint{
-		Version:   1,
+		Version:   2,
 		CreatedAt: time.Now().Format(time.RFC3339),
 		Config: TrainingCheckpointConfig{
 			NLayer:    nLayer,
@@ -1020,8 +1542,15 @@ func main() {
 			NHead:     nHead,
 			BlockSize: blockSize,
 		},
-		Vocab: runesToStrings(uchars),
 		State: exportState(state),
+	}
+	if tokenizer.mode == "bpe_cl100k" {
+		ckpt.Tokenization = tokenizer.mode
+		ckpt.BPEEncoding = tokenizer.bpeEncoding
+		ckpt.BPETokenIDs = append([]int(nil), tokenizer.localToBPE...)
+	} else {
+		ckpt.Tokenization = "char"
+		ckpt.Vocab = runesToStrings(tokenizer.localToChar)
 	}
 	if err := saveCheckpoint(modelOut, ckpt); err != nil {
 		fmt.Printf("[model] failed to save checkpoint: %v\n", err)
@@ -1033,5 +1562,14 @@ func main() {
 				fmt.Printf("[model] latest checkpoint: %s\n", latestPath)
 			}
 		}
+	}
+	bestOut := normalize(os.Getenv("MODEL_BEST_PATH"))
+	if bestOut == "" {
+		bestOut = filepath.Join("models", "best_checkpoint.json")
+	}
+	bestCkpt := ckpt
+	bestCkpt.State = bestState
+	if err := saveCheckpoint(bestOut, bestCkpt); err == nil {
+		fmt.Printf("[model] best checkpoint saved: %s (best_val=%.4f steps=%d)\n", bestOut, bestValLoss, actualSteps)
 	}
 }

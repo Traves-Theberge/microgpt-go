@@ -1,51 +1,55 @@
-# Conversational Assistant Training Plan
+# Training Plan
 
 ## Goal
 
-Train a conversational assistant model with consistent style and practical responses.
+Run stable conversational training with reproducible checkpoints and clear quality gates.
 
-## Operating Model
+## Standard Run
 
-Use the TUI for training so monitoring and logs are always on.
+1. `cd go`
+2. `./checks.sh`
+3. `go run ./cmd/mircogpt-tui`
+4. Select preset:
+   - `1` fast
+   - `2` balanced
+   - `3` max (overnight)
+5. Start training (`s`)
+6. Monitor:
+   - training loss
+   - validation loss
+   - early-stop behavior
+   - CPU/RAM stability
+7. Validate in `Chat` against `models/latest_checkpoint.json` and `models/best_checkpoint.json`
 
-```bash
-cd go
-go run ./cmd/mircogpt-tui
-```
+## Overnight Plan
 
-## Presets
-
-- `fast`: smoke validation run
-- `balanced`: default everyday run
-- `max`: slower but stronger run
-
-## Run Checklist
-
-1. `./checks.sh`
-2. Launch TUI
-3. Select preset (`1/2/3`)
-4. Start training (`s`)
-5. Watch step metrics + system usage
-6. Review generated samples and logs
+- Use preset `max`.
+- Keep `TOKENIZER=bpe`.
+- Increase `TOKEN_VOCAB_SIZE` cautiously from `2048` only if memory remains stable.
+- Keep validation enabled (`VAL_SPLIT=0.10`).
+- Keep early stopping enabled.
 
 ## Quality Gates
 
-1. Dataset schema passes (`go run . validate-dataset`)
-2. Training loss trends down
-3. Generated replies stay concise and actionable
-4. No malformed output spikes in last 20% of steps
-5. RAM/CPU remain stable through run
+- Dataset validation passes.
+- Validation loss improves over baseline.
+- `best_checkpoint.json` is saved.
+- Chat outputs are coherent on fixed prompts.
 
-## Iteration Loop
+## Prompt Set (Quick Eval)
 
-1. Tag weak outputs (vague, off-topic, verbose)
-2. Add corrective `chat` + `qa` + `preference` records
-3. Retrain with `balanced`
-4. Compare logs and sample quality
+Use the same prompts every run:
+1. "What can you do for me today?"
+2. "Help me plan a focused work block."
+3. "Summarize next actions from this context: ..."
+4. "Ask me 3 clarifying questions before you propose a plan."
 
-## Definition of Done
+## Artifacts To Keep
 
-- Schema clean
-- Stable training run in TUI
-- Better conversational quality vs previous dataset version
-- Logs and metrics archived for comparison
+- `logs/train/*`
+- `logs/system/*`
+- `logs/eval/*`
+- `logs/runs/*`
+- `models/ckpt_*.json`
+- `models/latest_checkpoint.json`
+- `models/best_checkpoint.json`

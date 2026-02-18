@@ -1,5 +1,6 @@
 # Built binaries
 /microgpt-go
+/mircogpt-tui
 /train-tui
 /chat-tui
 
@@ -12,6 +13,7 @@
 /assistant_dataset_*.jsonl
 /archive/*.jsonl
 /datasets/generated/
+/datasets/raw/
 !/datasets/examples/
 !/datasets/examples/*.jsonl
 /logs/*.log
