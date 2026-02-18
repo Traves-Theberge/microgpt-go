@@ -8,6 +8,14 @@ MicroGPT is a Go-first local training project with a unified terminal UI for:
 
 This is the top-level project guide. The runnable app lives in `go/`.
 
+## Attribution
+
+This project builds on ideas popularized by Andrej Karpathy.  
+Original reference gist:
+- https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95
+
+Karpathy is credited here as the original creator/inspiration for the foundational approach.
+
 ## Project Layout
 
 - `go/`: main application code, TUI, training runtime, artifacts
