@@ -1,71 +1,103 @@
-# MircoGPT-tui TUI Guide
+# MircoGPT-tui Guide
 
 ## Purpose
 
 One TUI for:
-- training
+- training configuration
 - monitoring
-- run/model artifacts
+- runs/models inspection
 - chat testing
 
-## Components
+## Tabs
 
-1. `go/cmd/mircogpt-tui/main.go`
-2. `go/main.go` (`train`, `validate-dataset`, `chat-once`)
+- `Splash`: animated intro
+- `Train`: full variable editor and guidance
+- `Monitor`: status, realtime graphs, eval tracking, and metric explorer
+- `Logs`: live training logs with scroll support
+- `Runs`: grouped run artifacts (`train`, `system`, `eval`, `manifest`)
+- `Models`: checkpoint list
+- `Chat`: conversation + model selector + prompt composer
 
-## Unified Hub Tabs
+## Chat UX (Current)
 
-- `Train`: full variable editor + preflight validation
-- `Monitor`: runtime system + step metrics + logs
-- `Runs`: recent run log artifacts
-- `Models`: saved checkpoint artifacts
-- `Chat`: integrated inference test panel
+- Conversation panel uses available tab height and wraps long lines.
+- Scrolling supported with `pgup`/`pgdown` and `home`/`end`.
+- Typing mode locks hotkeys to prevent accidental tab switching.
 
-## Variable Guidance (Selection-Based)
+## Dataset Selection UX
 
-The `Train` tab shows contextual guidance for the selected variable (terminal equivalent of hover help):
-- expected type
-- valid range/allowed values
-- behavior impact notes
-- practical usage tips
+- In `Train`, highlight `DATASET_PATH` and press `f`.
+- A searchable dataset picker opens across known `.jsonl` paths.
+- Type to filter, use `j/k`, press `enter` to apply path.
 
-## Training Console Flow
+## Runtime Coverage
+
+- Dataset/tokenization:
+  - `DATASET_PATH`, `TOKENIZER`, `BPE_ENCODING`, `TOKEN_VOCAB_SIZE`
+- Model shape:
+  - `N_LAYER`, `N_EMBD`, `N_HEAD`, `BLOCK_SIZE`
+- Optimizer:
+  - `LEARNING_RATE`, `BETA1`, `BETA2`, `EPS_ADAM`
+- Validation/early stop:
+  - `VAL_SPLIT`, `EVAL_INTERVAL`, `EVAL_STEPS`, `EARLY_STOP_PATIENCE`, `EARLY_STOP_MIN_DELTA`
+- Generation:
+  - `TEMPERATURE`, `SAMPLE_COUNT`, `SAMPLE_MAX_NEW_TOKENS`, `TOP_K`, `TOP_P`, `REPETITION_PENALTY`, `MIN_NEW_TOKENS`, `REPEAT_LAST_N`
+- Runtime/logging:
+  - `TRAIN_DEVICE`, `METRIC_INTERVAL`, `LOG_LEVEL`, `VERBOSE`
+- Output:
+  - `MODEL_OUT_PATH`
+
+Default device request is `TRAIN_DEVICE=cpu`.
+
+## Training Flow
 
 ```mermaid
 flowchart LR
 A[Train tab] --> B[start go run .]
-B --> C[live step metrics]
-B --> D[system monitor CPU/RAM/RSS]
-B --> E[checkpoint save]
-E --> F[models/latest_checkpoint.json]
+B --> C[step metrics + logs]
+B --> D[validation checks]
+D --> E[early stop decision]
+B --> F[checkpoint save]
+F --> G[latest_checkpoint.json]
+F --> H[best_checkpoint.json]
 ```
 
-## Chat Flow (Integrated)
+## Artifact Paths
 
-```mermaid
-flowchart LR
-A[Chat tab prompt] --> B[go run . chat-once checkpoint prompt]
-B --> C[load checkpoint]
-C --> D[run generation]
-D --> E[render assistant reply in Chat tab]
-```
+- Logs:
+  - `go/logs/train/tui_train_<run-tag>.log`
+  - `go/logs/system/tui_system_metrics_<run-tag>.csv`
+  - `go/logs/eval/tui_eval_metrics_<run-tag>.csv`
+  - `go/logs/runs/run_<run-tag>.txt`
+  - `go/logs/train_latest.log`
+- Models:
+  - `go/models/ckpt_<run-tag>_step<steps>_valloss<loss>.json`
+  - `go/models/latest_checkpoint.json`
+  - `go/models/best_checkpoint.json`
 
-## Runtime Settings Coverage
+## Monitor Graphs
 
-- dataset/config: `DATASET_PATH`, `N_LAYER`, `N_EMBD`, `N_HEAD`, `BLOCK_SIZE`, `NUM_STEPS`
-- optimizer: `LEARNING_RATE`, `BETA1`, `BETA2`, `EPS_ADAM`
-- generation: `TEMPERATURE`, `SAMPLE_COUNT`
-- runtime/logging: `TRAIN_DEVICE`, `METRIC_INTERVAL`, `LOG_LEVEL`, `VERBOSE`
-- output: `MODEL_OUT_PATH`
+- Train loss (full in-run history)
+- Validation loss (full in-run history)
+- Generalization gap (`val_loss - train_loss`)
+- Steps/sec
+- Tokens/sec
+- Learning rate
+- Validation perplexity
+- CPU %
+- RAM used (MB)
+- Process RSS (MB)
 
-Chat controls in tab:
-- temperature: `[` `]`
-- max tokens: `-` `=`
+## Monitor Explorer
 
-## Logs and Artifacts
+In `Monitor`, use:
+- `left/right` to switch metric categories
+- `up/down` to select a metric
+- `enter` to focus selected metric in full graph mode
+- `esc` to exit focus mode
+- `pgup/pgdown/home/end` to scroll
 
-- `go/logs/tui_train_<preset>_<timestamp>.log`
-- `go/logs/tui_system_metrics_<preset>_<timestamp>.csv`
-- `go/logs/train_latest.log`
-- `go/models/checkpoint_<timestamp>.json`
-- `go/models/latest_checkpoint.json`
+The `Metric Explorer` panel explains each selected graph:
+- what it measures
+- why it matters
+- how to interpret trends

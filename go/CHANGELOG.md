@@ -18,6 +18,7 @@ All notable changes to `microgpt-go` are documented here.
   - improved `Field Detail` readability with split guidance formatting.
 - Monitor metric cleanup:
   - removed low-value runtime internals from default display (`Go Heap`, `Go Runtime Sys`, `Goroutines`, `GC Count`).
+- Documentation and README synchronized to current TUI behavior, controls, and metric set.
 
 ## [0.0.3] - 2026-02-18
 

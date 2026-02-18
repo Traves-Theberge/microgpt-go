@@ -1,15 +1,18 @@
 # microgpt-go
 
-`microgpt-go` is a compact Go training project for building a personal assistant model from JSONL data, with a unified terminal UI (`MircoGPT-tui`) for configuration, training, monitoring, artifacts, and chat testing.
+Version: `0.0.4`
 
-## What You Get
+`microgpt-go` is a compact Go training project for building a conversational assistant model from JSONL data, with a unified TUI (`MircoGPT-tui`) for configuration, training, monitoring, artifacts, and chat testing.
 
-- Character-level GPT-style training loop in Go
-- Strict dataset schema validation (`id` + `record_type`)
-- Unified TUI dashboard: config, monitor, runs, models, chat
-- Auto checkpointing after training
-- Built-in system monitoring (CPU, RAM, process RSS)
-- Live logs and trend graphs
+## Highlights
+
+- BPE-first tokenization (`cl100k_base`) with offline loader
+- Validation split + early stopping + best checkpoint saving
+- Improved decoding controls (`top-k`, `top-p`, repetition penalty, min new tokens)
+- Unified training dashboard with live metrics, eval tracking, and run artifacts
+- Chat testing panel with better wrapping and scroll controls
+- Structured run folders (`train`, `system`, `eval`, `runs`) + manifest files
+- Auto checkpoint naming by run tag (`ckpt_<run>_step####_valloss#.json`)
 
 ## Quick Start
 
@@ -20,122 +23,78 @@ go mod tidy
 go run ./cmd/mircogpt-tui
 ```
 
-## Core Workflow
+## Current Defaults (0.0.4)
 
-1. Open TUI: `go run ./cmd/mircogpt-tui`
-2. In `Train` tab, set variables or apply a preset (`1/2/3`)
-3. Start training with `s`
-4. Watch metrics in `Monitor`
-5. Review outputs in `Runs` and `Models`
-6. Test response behavior in `Chat`
+- `TOKENIZER=bpe`
+- `BPE_ENCODING=cl100k_base`
+- `DATASET_PATH=datasets/raw/databricks-dolly-15k.jsonl`
+- `TOKEN_VOCAB_SIZE=2048`
+- `N_LAYER=1`, `N_EMBD=48`, `N_HEAD=4`, `BLOCK_SIZE=96`
+- `NUM_STEPS=800`, `LEARNING_RATE=0.004`
+- `VAL_SPLIT=0.10`, `EVAL_INTERVAL=50`, `EARLY_STOP_PATIENCE=8`
+- `TRAIN_DEVICE=cpu`
 
-## TUI Overview
+## Dataset
 
-Tabs:
-- `Train`: full editable variable list with contextual guidance
-- `Monitor`: live training metrics, system stats, logs, graphs
-- `Runs`: recent run logs
-- `Models`: saved checkpoints
-- `Chat`: integrated inference testing against checkpoints
+Active training dataset:
+- `datasets/raw/databricks-dolly-15k.jsonl`
 
-Global keys:
-- `tab` / `shift+tab` (or `l` / `h`): switch tabs
-- `s`: start training
-- `x`: stop training
-- `r`: refresh run/model lists
-- `c`: clear current tab log/chat view
-- `q`: quit
+Source snapshot:
+- `datasets/raw/databricks-dolly-15k.jsonl`
 
-Train tab keys:
-- `j/k` or arrows: move field selection
-- `e` or `enter`: edit selected value
-- `space`: cycle bool/choice values
-- `1`: apply `fast` preset
-- `2`: apply `balanced` preset
-- `3`: apply `max` preset
-
-Chat tab keys:
-- `enter`: send prompt
-- `p`: toggle checkpoint path edit mode
-- `L`: auto-load `models/latest_checkpoint.json`
-- `[` `]`: decrease/increase chat temperature
-- `-` `=`: decrease/increase max new tokens
-
-## Configuration Variables
-
-All are editable in `Train` tab.
-
-Dataset and model shape:
-- `DATASET_PATH`
-- `N_LAYER`
-- `N_EMBD`
-- `N_HEAD`
-- `BLOCK_SIZE`
-- `NUM_STEPS`
-
-Optimizer:
-- `LEARNING_RATE`
-- `BETA1`
-- `BETA2`
-- `EPS_ADAM`
-
-Generation:
-- `TEMPERATURE`
-- `SAMPLE_COUNT`
-
-Runtime and logging:
-- `TRAIN_DEVICE` (`cpu` or `gpu` request)
-- `METRIC_INTERVAL`
-- `LOG_LEVEL` (`info` or `debug`)
-- `VERBOSE`
-
-Outputs:
-- `MODEL_OUT_PATH`
-
-Notes:
-- `N_EMBD` must be divisible by `N_HEAD`.
-- Current compute path is CPU. If `gpu` is requested, training logs fallback to CPU.
-
-## Presets
-
-Available presets in TUI:
-- `fast`: quick smoke run
-- `balanced`: recommended default
-- `max`: heavier run
-
-Presets set a base config. You can still edit any field after applying one.
-
-## Dataset Format
-
-Training expects JSONL (one object per line).
-
-Required on each row:
-- `id` (unique)
-- `record_type`
-
-Supported `record_type` values:
-- `knowledge`
-- `memory`
-- `qa`
-- `chat`
-- `trajectory`
-- `preference`
-
-Example dataset files (GitHub-safe):
-- `datasets/examples/assistant_dataset_example_minimal.jsonl`
-- `datasets/examples/assistant_dataset_example_personal_agent.jsonl`
-- `datasets/examples/assistant_dataset_example_eval.jsonl`
-
-Use an example:
+Validate dataset:
 
 ```bash
-cp datasets/examples/assistant_dataset_example_personal_agent.jsonl assistant_dataset_train.jsonl
 go run . validate-dataset
 ```
 
-## CLI Commands
+## TUI Controls
 
-Train directly:
+Global:
+- `tab` / `shift+tab` (`l` / `h`) switch tabs
+- `s` start training
+- `x` stop training
+- `r` refresh lists
+- `c` clear current logs/chat
+- `q` quit
+- In `Train`, select `DATASET_PATH` and press `f` to open dataset picker/search
+- Bottom command bar is context-aware by tab (global + tab-specific hints)
+
+Chat:
+- `enter` start typing, then send
+- `esc` exit typing
+- `pgup` / `pgdown` scroll history
+- `home` / `end` jump top/bottom
+- `p` edit checkpoint path
+- `L` load `models/latest_checkpoint.json`
+- `[` `]` temperature down/up
+- `-` `=` max tokens down/up
+
+Dataset picker:
+- Type to filter dataset files
+- `j/k` move selection
+- `enter` apply selected path
+- `esc` cancel
+
+Monitor:
+- `left` / `right` switch metric category (`All`, `Core`, `Eval`, `System`)
+- `up` / `down` focus a metric in the explorer panel
+- `pgup` / `pgdown` / `home` / `end` scroll monitor content
+- `enter` toggle full graph focus for selected metric
+- `esc` exit focused graph view
+- Metric Explorer explains each metric in plain language:
+  - what it is
+  - why it matters
+  - how to interpret it
+
+Logs:
+- `Logs` tab shows live streaming logs
+- `pgup` / `pgdown` / `home` / `end` scroll logs
+- `c` clears the live log panel
+
+## CLI
+
+Train:
 
 ```bash
 go run .
@@ -147,78 +106,57 @@ Validate dataset:
 go run . validate-dataset
 ```
 
-One-shot inference from checkpoint:
+GPU readiness check:
+
+```bash
+go run . gpu-check
+```
+
+One-shot inference:
 
 ```bash
 go run . chat-once models/latest_checkpoint.json "Help me prioritize my day"
 ```
 
-Run full local checks:
-
-```bash
-./checks.sh
-```
-
-## Artifacts and Paths
+## Artifacts
 
 Logs:
-- `logs/tui_train_<...>.log`
-- `logs/tui_system_metrics_<...>.csv`
+- `logs/train/tui_train_<...>.log`
+- `logs/system/tui_system_metrics_<...>.csv`
+- `logs/eval/tui_eval_metrics_<...>.csv`
+- `logs/runs/run_<...>.txt`
 - `logs/train_latest.log`
 
 Models:
-- `models/checkpoint_<timestamp>.json`
+- `models/ckpt_<run-tag>_step<steps>_valloss<loss>.json`
 - `models/latest_checkpoint.json`
+- `models/best_checkpoint.json`
 
-Tracked examples:
-- `datasets/examples/*.jsonl`
+## Monitor Coverage
 
-Ignored (via gitignore):
-- runtime logs
-- generated checkpoints
-- local large dataset variants
+The `Monitor` tab now tracks and visualizes:
+- Train loss history
+- Validation loss history
+- Generalization gap (`val_loss - train_loss`)
+- Throughput (steps/sec and tokens/sec)
+- CPU usage
+- RAM used (system)
+- RSS used (trainer process)
+- Learning rate
+- Validation perplexity
 
-## Architecture (High Level)
+Each graph keeps full in-run history (not just a short window), and eval snapshots are written to `logs/eval/` for post-run analysis.
+Graph motion smoothing uses `harmonica` springs in the TUI runtime.
 
-- `main.go`:
-  - dataset parsing/validation
-  - training loop
-  - checkpoint save/load
-  - `chat-once` inference mode
-- `cmd/mircogpt-tui/main.go`:
-  - unified dashboard
-  - process orchestration (`go run .`)
-  - metrics parsing and system sampling
-  - integrated chat panel
+## Notes
 
-## Known Limitations
+- `TOKEN_VOCAB_SIZE=2048` is the laptop-safe default.
+- Training remains CPU-first. `TRAIN_DEVICE=gpu` is accepted but currently falls back to CPU kernels.
 
-- Character-level modeling (not subword tokenization)
-- CPU-first implementation (GPU request accepted, then fallback)
-- Educational codebase, not production-scale throughput
-
-## Troubleshooting
-
-TUI seems stuck:
-- Ensure you are on latest code and rerun `./checks.sh`
-- Open `Monitor` tab and verify process status/logs
-- Stop with `x`, then start again with `s`
-
-Validation fails:
-- Run `go run . validate-dataset`
-- Fix the first reported line-level schema error
-
-No chat output:
-- Confirm checkpoint exists in `models/latest_checkpoint.json`
-- In `Chat` tab, press `L` to load latest path
-- Lower temperature and retry
-
-## Documentation Index
+## Docs
 
 - `../docs/go/README.md`
-- `../docs/go/INSTALLATION.md`
-- `../docs/go/USAGE.md`
 - `../docs/go/TRAINING_HUB_GUIDE.md`
-- `../docs/go/DATASET_GUIDE.md`
-- `../docs/go/EXAMPLE_DATASETS.md`
-- `../docs/go/TRAINING_PLAN.md`
+- `../docs/go/GPU_READINESS.md`
+- `../docs/go/MONITORING_RESEARCH.md`
+- `CHANGELOG.md`
